@@ -22,13 +22,19 @@ class HaliteEnv(gym.Env):
       Layer 4: Ownership
       Layer 5: Inspiration (not given as part of observation by default)
    
+   self.mapSize : int
+      Size of map (for x and y)
+
+   self.numPlayers : int
+      Number of players
+
    self.playerHalite : np.ndarray
       Stores the total halite a player with ownership id <index + 1> has. self.map also stores the total halite 
       with the halite under factories/dropoffs, but doesn't include the 5000 initial.
    """
-   metadata = {'render_modes':['human']}
+   metadata = {'render_modes':['human'], 'map_size':0, 'num_players':0}
    
-   def __init__(self, numPlayers, mapType, mapSize):
+   def __init__(self, numPlayers, mapType, mapSize, regenMapOnReset = False):
       """
       HaliteEnv initialization function.
       """
@@ -39,6 +45,11 @@ class HaliteEnv(gym.Env):
       self.playerHalite.fill(5000)
       self.numPlayers = numPlayers
       self.mapSize = mapSize.value
+      self.regenMap = regenMapOnReset
+      self.metadata['map_size'] = mapSize.value
+      self.metadata['num_players'] = numPlayers
+      if(not self.regenMap):
+         self.originalMap = self.map.copy()
    
    def step(self, action):
       """
@@ -46,9 +57,9 @@ class HaliteEnv(gym.Env):
       
       Parameters:
       -----------
-      action : array
+      action : np.ndarray
          Array of length <numPlayers> where each element is an action for the player
-         whose id is (index + 1)
+         whose id is (index + 1). Shape is (mapSize, mapSize, numPlayers).
          Each player's actions are represented as a 2D array the size of the map, where
          each element is what move to do on an element of the map. This means that many extra/
          illegal moves are made, which are ignored during the step.
@@ -77,35 +88,50 @@ class HaliteEnv(gym.Env):
          info (dict)
             Info for debugging. 
       """
-      playerReward = np.zeros((numPlayers, 1))
+      playerReward = np.zeros((self.numPlayers))
       #Process turns first
       #Loop through ships and factories and pull from corresponding player's actions for that ship/factory
       ships = np.where(self.map[:, :, 3] == 1)
-      for ship in ships:
-         act = action[self.map[ship[0], ship[1], 4] - 1][ship[0]][ship[1]]
+      for loc in range(0, len(ships[0])):
+         #ships[0] are Y, ships[1] are X
+         #print(ships[1][loc], ships[0][loc], self.map[ships[0][loc], ships[1][loc], 4].astype(np.int64) - 1)
+         if(self.map[ships[0][loc], ships[1][loc], 3] != 0 and self.map[ships[0][loc], ships[1][loc], 4] == 0):
+            #This if statement is very dangerous. A lot of bugs might be hidden because of it.
+            #So why is it here? I modify the map as I'm iterating through ships. If a ship dies, the map is updated but
+            #the indices aren't!
+            #TODO: Consider switching to only doing movements after I've iterated through all ships, like the Halite game engine does
+            self.map[ships[0][loc], ships[1][loc], 1] = 0
+            self.map[ships[0][loc], ships[1][loc], 3] = 0
+            if(self.map[ships[0][loc], ships[1][loc], 2] == 0):
+               self.map[ships[0][loc], ships[1][loc], 4] = 0
+         act = action[ships[0][loc], ships[1][loc], self.map[ships[0][loc], ships[1][loc], 4].astype(np.int64) - 1]
          success = True
          if(act == 2):
-            success = self.constructDropoff(ship[1], ship[0])
+            success = self.constructDropoff(ships[0][loc], ships[1][loc])
          elif(act == 3):
-            success = self.moveShip(ship[1], ship[0], 'N')
+            success = self.moveShip(ships[0][loc], ships[1][loc], 'N')
          elif(act == 4):
-            success = self.moveShip(ship[1], ship[0], 'E')
+            success = self.moveShip(ships[0][loc], ships[1][loc], 'E')
          elif(act == 5):
-            success = self.moveShip(ship[1], ship[0], 'S')
+            success = self.moveShip(ships[0][loc], ships[1][loc], 'S')
          elif(act == 6):
-            success = self.moveShip(ship[1], ship[0], 'W')
+            success = self.moveShip(ships[0][loc], ships[1][loc], 'W')
          
          #Deinceventize outright bad/invalid moves
          if(not success):
-            playerReward[self.map[ship[1], ship[0], 4] - 1] -= 0.1
+            #print("Move was invalid! Move: " + str(act))
+            playerReward[self.map[ships[0][loc], ships[1][loc], 4].astype(np.int64) - 1] -= 0.1
       factories = np.where(self.map[:, :, 2] == 1)
-      for factory in factories:
-         act = action[self.map[factory[0], factory[1], 4] - 1][factory[0]][factory[1]]
+      for loc in range(0, len(factories[0])):
+         #factories[0] are Y, factories[1] are X
+         assert self.map[factories[0][loc], factories[1][loc], 4].astype(np.int64) - 1 >= 0, "Error, map seems corrupted for factories"
+         act = action[factories[0][loc], factories[1][loc], self.map[factories[0][loc], factories[1][loc], 4].astype(np.int64) - 1]
+         success = True
          if(act == 1):
-            success = self.spawnShip(factory[1], factory[0])
+            success = self.spawnShip(factories[0][loc], factories[1][loc])
          #Deinceventize outright bad/invalid moves
          if(not success):
-            playerReward[self.map[ship[1], ship[0], 4] - 1] -= 0.1
+            playerReward[self.map[factories[0][loc], factories[1][loc], 4].astype(np.int64) - 1] -= 0.1
 
       #Reset inspiration map
       self.map[:, :, 5].fill(0)
@@ -113,28 +139,28 @@ class HaliteEnv(gym.Env):
       nearShips = np.where(self.map[:, :, 3] == 1)
       maxEnergy = Constants.MAX_ENERGY
       bonusMultiplier = Constants.INSPIRED_BONUS_MULTIPLIER
-      for ship in nearShips:
-         #Remember ship[0] is y and ship[1] is x
-         inspired = self.isInspired(ship[1], ship[0])
+      for loc in range(0, len(nearShips[0])):
+         #Remember ships[0][loc] is y and ships[1][loc] is x
+         inspired = self.isInspired(nearShips[1][loc], nearShips[0][loc])
          ratio = Constants.INSPIRED_EXTRACT_RATIO if inspired else Constants.EXTRACT_RATIO
-         extracted = np.ceil(self.map[ship[0], ship[1], 0] / ratio).astype(np.int64)
+         extracted = np.ceil(self.map[nearShips[0][loc], nearShips[1][loc], 0] / ratio).astype(np.int64)
          gained = extracted
-         if(extracted == 0 and self.map[ship[0], ship[1], 0] > 0):
-            extracted = gained = self.map[ship[0], ship[1], 0]
-         if(extracted + self.map[ship[0], ship[1], 1] > maxEnergy):
-            extracted = maxEnergy - self.map[ship[0], ship[1], 1]
+         if(extracted == 0 and self.map[nearShips[0][loc], nearShips[1][loc], 0] > 0):
+            extracted = gained = self.map[nearShips[0][loc], nearShips[1][loc], 0]
+         if(extracted + self.map[nearShips[0][loc], nearShips[1][loc], 1] > maxEnergy):
+            extracted = maxEnergy - self.map[nearShips[0][loc], nearShips[1][loc], 1]
          if(inspired):
             gained += bonusMultiplier * gained
-         if(maxEnergy - self.map[ship[0], ship[1], 1] < gained):
-            gained = maxEnergy - self.map[ship[0], ship[1], 1]
-         self.map[ship[0], ship[1], 1] += gained
-         self.map[ship[0], ship[1], 0] -= extracted
+         if(maxEnergy - self.map[nearShips[0][loc], nearShips[1][loc], 1] < gained):
+            gained = maxEnergy - self.map[nearShips[0][loc], nearShips[1][loc], 1]
+         self.map[nearShips[0][loc], nearShips[1][loc], 1] += gained
+         self.map[nearShips[0][loc], nearShips[1][loc], 0] -= extracted
          
          #Capture is currently disabled according to constants, so not adding it
       for playerId in range(0, len(playerReward)):
-         playerReward[playerId] += playerHalite[playerId] * 0.0005
+         playerReward[playerId] += self.playerHalite[playerId] * 0.0005
       
-      return (self.map[:, :, :5], playerReward)
+      return ((self.map[:, :, :5], self.playerHalite), playerReward)
    
    def render(self, mode = 'human'):
       """
@@ -145,18 +171,37 @@ class HaliteEnv(gym.Env):
       """
       fig = plt.figure(figsize=(8, 8))
       fig.add_subplot(2, 3, 1)
+      plt.gca().set_title("Halite Map")
       plt.imshow(self.map[:, :, 0], cmap='hot', interpolation='nearest')
       fig.add_subplot(2, 3, 2)
+      plt.gca().set_title("Ship Amount")
       plt.imshow(self.map[:, :, 1], cmap='hot', interpolation='nearest')
       fig.add_subplot(2, 3, 3)
+      plt.gca().set_title("Factory/Dropoff Locs")
       plt.imshow(self.map[:, :, 2], cmap='hot', interpolation='nearest')
       fig.add_subplot(2, 3, 4)
+      plt.gca().set_title("Ship Locs")
       plt.imshow(self.map[:, :, 3], cmap='hot', interpolation='nearest')
       fig.add_subplot(2, 3, 5)
+      plt.gca().set_title("Ownership")
       plt.imshow(self.map[:, :, 4], cmap='hot', interpolation='nearest')
       fig.add_subplot(2, 3, 6)
+      plt.gca().set_title("Inspiration")
       plt.imshow(self.map[:, :, 5], cmap='hot', interpolation='nearest')
+      plt.gcf().text(0.5, 0.5, "Player Halite: " + str(self.playerHalite))
       plt.show()
+
+   def reset(self):
+      """
+      Resets HaliteEnv environment. If <regenMapOnReset> in __init__() is True, it regenerates the map. 
+      Otherwise, it just replaces the used map with a copy of the original.
+      """
+      if(not self.regenMap):
+         self.map = self.originalMap.copy()
+      else:
+         self.map = Map.generateFractalMap(self.mapSize, self.numPlayers)
+      self.playerHalite = np.empty((numPlayers, 1))
+      self.playerHalite.fill(5000)
 
    def isInspired(self, shipX, shipY):
       """
@@ -164,6 +209,7 @@ class HaliteEnv(gym.Env):
       The calculation is not perfect - it missed inspired ships at far diagonals
       since it does calculations based on rectangles.
       TODO: Improve inspired calculations (add more rectangles to check)
+      PRIORITY TODO: Critical bug where enemies inspire each other
       
       Parameters:
       -----------
@@ -179,7 +225,7 @@ class HaliteEnv(gym.Env):
       """
       #First check if ship is inspired - it would be inspired if it had a 1 at index 4
       if(self.map[shipY, shipX, 5] == 1):
-         return true
+         return True
       #If it isn't inspired check nearby ships
       #First rectangle check (13x11)
       marginX1 = shipX - 6
@@ -197,9 +243,10 @@ class HaliteEnv(gym.Env):
       #TODO: More rectangle checks to improve accuracy
       #TODO: Is there a NumPy improvement to below (so I don't have to compare against 1)?
       nearShips = np.where(self.map[marginY1:marginY2, marginX1:marginX2, 3] == 1)
-      for ship in nearShips:
-         x = ship[1] + marginX1
-         y = ship[0] + marginY1
+      for loc in range(0, len(nearShips[0])):
+         #for nearX in nearShips[1]:
+         x = nearShips[1][loc] + marginX1
+         y = nearShips[0][loc] + marginY1
          if(self.map[y, x, 4] == self.map[shipY, shipX, 4]):
             #Found nearby ship, setting inspiration and returning
             self.map[marginY1:marginY2, marginX1:marginX2, 5] = 1
@@ -207,7 +254,7 @@ class HaliteEnv(gym.Env):
       self.map[marginY1:marginY2, marginX1:marginX2, 5] = 1
       return False
 
-   def destroyShip(self, shipX, shipY):
+   def destroyShip(self, shipY, shipX):
       """
       Destroys ship at coordinates <X, Y>
       
@@ -224,7 +271,7 @@ class HaliteEnv(gym.Env):
       if(self.map[shipY, shipX, 2] == 0):
          self.map[shipY, shipX, 4] = 0
 
-   def constructDropoff(self, shipX, shipY):
+   def constructDropoff(self, shipY, shipX):
       """
       Converts the Ship at <shipX, shipY> to a Dropoff.
       
@@ -241,16 +288,19 @@ class HaliteEnv(gym.Env):
          Whether Dropoff construction was successful
       """
       #First, check if player has enough halite to construct dropoff. If not, return False
-      if((self.playerHalite[self.map[shipY, shipX, 4] - 1] + self.map[shipY, shipX, 0] - Constants.DROPOFF_COST) < 0):
+      if((self.playerHalite[self.map[shipY, shipX, 4].astype(np.int64) - 1] + self.map[shipY, shipX, 0] - Constants.DROPOFF_COST) < 0):
          return False
-      self.playerHalite[self.map[shipY, shipX, 4] - 1] += self.map[shipY, shipX, 0]
-      self.playerHalite[self.map[shipY, shipX, 4] - 1] -= Constants.DROPOFF_COST
+      #There is already a dropoff/factory here, don't recreate
+      if(self.map[shipY, shipX, 2] != 0):
+         return False
+      self.playerHalite[self.map[shipY, shipX, 4].astype(np.int64) - 1] += self.map[shipY, shipX, 0]
+      self.playerHalite[self.map[shipY, shipX, 4].astype(np.int64) - 1] -= Constants.DROPOFF_COST
       self.map[shipY, shipX, 3] = 0
       self.map[shipY, shipX, 2] = -1
       self.map[shipY, shipX, 0] = 0
       return True
 
-   def moveShip(self, shipX, shipY, move):
+   def moveShip(self, shipY, shipX, move):
       """
       Moves the ship at <shipX, shipY> in the direction specified by <move>
    
@@ -322,29 +372,32 @@ class HaliteEnv(gym.Env):
          #There exists a ship where we are trying to move
          if(self.map[shipY, shipX, 4] == self.map[newY, newX, 4]):
             #We are trying to hit our own ship.
-            #Later, try removing this and see if some weird strategy emerges
+            #Later, try removing this and see if some strategy emerges (like crashing ships at end to speed up dropoff)
             return False
          else:
             #Handle collisions
             #Note that having allied ships crash into each other is better at the end (to speed up dropoff)
             #I will need to rewrite this code if I decide to add hitting own ships
-            self.map[shipY, shipX, 4] = 0
+            if(self.map[shipY, shipX, 2] == 0):
+               self.map[shipY, shipX, 4] = 0
             self.map[shipY, shipX, 3] = 0
-            self.map[newY, newX, 4] = 0
+            if(self.map[newY, newX, 2] == 0):
+               self.map[newY, newX, 4] = 0
             self.map[newY, newX, 3] = 0
             self.map[newY, newX, 0] += self.map[shipY, shipX, 1] + self.map[newY, newX, 1]
             self.map[newY, newX, 1] = 0
             self.map[shipY, shipX, 1] = 0
             return True
-      elif(np.abs(self.map[newY, newX, 2]) == 1):
+      elif(self.map[newY, newX, 2] != 0):
          if(self.map[newY, newX, 4] == self.map[shipY, shipX, 4]):
             #Depositing into dropoff/factory
             self.map[newY, newX, 1] += self.map[shipY, shipX, 1]
-            self.playerHalite[self.map[shipY, shipX, 4] - 1] += self.map[shipY, shipX, 1]
+            self.playerHalite[self.map[shipY, shipX, 4].astype(np.int64) - 1] += self.map[shipY, shipX, 1]
             #Removing ship's owned halite
             self.map[shipY, shipX, 1] = 0
             #Moving ship on top
-            self.map[shipY, shipX, 4] = 0
+            if(self.map[shipY, shipX, 2] == 0):
+               self.map[shipY, shipX, 4] = 0
             self.map[shipY, shipX, 3] = 0
             self.map[newY, newX, 3] = 1
             return True
@@ -356,12 +409,14 @@ class HaliteEnv(gym.Env):
          self.map[newY, newX, 4] = self.map[shipY, shipX, 4]
          self.map[newY, newX, 3] = 1
          self.map[newY, newX, 1] = self.map[shipY, shipX, 1]
-         self.map[shipY, shipX, 4] = 0
          self.map[shipY, shipX, 3] = 0
          self.map[shipY, shipX, 1] = 0
+         if(np.abs(self.map[shipY, shipX, 2]) == 0):
+            #Only change ownership if we weren't on top of dropoff/factory
+            self.map[shipY, shipX, 4] = 0
          return True
          
-   def spawnShip(self, factoryX, factoryY):
+   def spawnShip(self, factoryY, factoryX):
       """
       Spawns a Ship at coordinates <factoryX, factoryY>
 
@@ -377,14 +432,14 @@ class HaliteEnv(gym.Env):
       bool
          Whether spawning ship was succesful
       """
-      if(self.playerHalite[self.map[factoryY, factoryX, 4] - 1] - Constants.NEW_ENTITY_ENERGY_COST < 0):
+      if(self.playerHalite[self.map[factoryY, factoryX, 4].astype(np.int64) - 1] - Constants.NEW_ENTITY_ENERGY_COST < 0):
          return False
       else:
          if(self.map[factoryY, factoryX, 3] == 1):
             #Ship exists on top of factory already - don't create
             return False
          else:
-            self.playerHalite[self.map[factoryY, factoryX, 4] - 1] -= Constants.NEW_ENTITY_ENERGY_COST
+            self.playerHalite[self.map[factoryY, factoryX, 4].astype(np.int64) - 1] -= Constants.NEW_ENTITY_ENERGY_COST
             self.map[factoryY, factoryX, 3] = 1
             self.map[factoryY, factoryX, 1] = 0
             return True
